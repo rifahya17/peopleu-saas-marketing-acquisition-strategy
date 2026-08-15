@@ -1,0 +1,29 @@
+#Cek 1 lead 1 contract
+SELECT
+    leads_id,
+    COUNT(*) AS contract_count
+FROM `new-portfolio-1.PeopleU_B2B_Software_SaaS.contract`
+GROUP BY leads_id
+HAVING COUNT(*) > 1
+ORDER BY contract_count DESC;
+
+
+#Cek quantity lead vs contract
+SELECT
+    COUNT(*) AS total_leads,
+    COUNT(DISTINCT leads_id) AS unique_leads
+FROM `new-portfolio-1.PeopleU_B2B_Software_SaaS.leads`;
+
+SELECT
+    COUNT(*) AS total_contract_rows,
+    COUNT(DISTINCT contract_id) AS unique_contracts,
+    COUNT(DISTINCT leads_id) AS contracted_leads
+FROM `new-portfolio-1.PeopleU_B2B_Software_SaaS.contract`;
+
+#Cek contract include in leads
+SELECT
+    COUNT(*) AS contracts_without_matching_lead
+FROM `new-portfolio-1.PeopleU_B2B_Software_SaaS.contract` c
+LEFT JOIN `new-portfolio-1.PeopleU_B2B_Software_SaaS.leads` l
+    ON c.leads_id = l.leads_id
+WHERE l.leads_id IS NULL;
