@@ -1,0 +1,294 @@
+-- ============================================================
+-- M2-A — MONTHLY MARKETING SPEND RESPONSE DIAGNOSTIC
+-- ============================================================
+--
+-- Objective:
+-- Measure observed monthly relationship between:
+-- Spend -> Leads -> Contracts -> Lifecycle GMV
+--
+-- Also checks 1-month lag:
+-- Spend_t -> Leads_(t+1)
+--
+-- IMPORTANT:
+-- This is observational response analysis,
+-- NOT causal attribution.
+-- ============================================================
+
+WITH spend_long AS (
+
+    SELECT
+        cohort_month,
+        'CPC' AS session_source,
+        cpc_spend AS marketing_spend
+    FROM `new-portfolio-1.PeopleU_B2B_Software_SaaS.saas_additional_clean`
+
+    UNION ALL
+
+    SELECT
+        cohort_month,
+        'Direct',
+        direct_spend
+    FROM `new-portfolio-1.PeopleU_B2B_Software_SaaS.saas_additional_clean`
+
+    UNION ALL
+
+    SELECT
+        cohort_month,
+        'Organic Search',
+        organic_search_spend
+    FROM `new-portfolio-1.PeopleU_B2B_Software_SaaS.saas_additional_clean`
+
+    UNION ALL
+
+    SELECT
+        cohort_month,
+        'Organic Social',
+        organic_social_spend
+    FROM `new-portfolio-1.PeopleU_B2B_Software_SaaS.saas_additional_clean`
+
+    UNION ALL
+
+    SELECT
+        cohort_month,
+        'Referral',
+        referral_spend
+    FROM `new-portfolio-1.PeopleU_B2B_Software_SaaS.saas_additional_clean`
+),
+
+lead_base AS (
+
+    SELECT DISTINCT
+        l.leads_id,
+
+        DATE_TRUNC(
+            DATE(l.leads_registered),
+            MONTH
+        ) AS acquisition_month,
+
+        CASE
+            WHEN LOWER(TRIM(s.session_source))
+                IN ('referral', 'refferal')
+                THEN 'Referral'
+
+            WHEN LOWER(TRIM(s.session_source)) = 'cpc'
+                THEN 'CPC'
+
+            WHEN LOWER(TRIM(s.session_source)) = 'direct'
+                THEN 'Direct'
+
+            WHEN LOWER(TRIM(s.session_source))
+                IN ('organic search', 'organic_search')
+                THEN 'Organic Search'
+
+            WHEN LOWER(TRIM(s.session_source))
+                IN ('organic social', 'organic_social')
+                THEN 'Organic Social'
+
+            ELSE TRIM(s.session_source)
+        END AS session_source
+
+    FROM `new-portfolio-1.PeopleU_B2B_Software_SaaS.leads` AS l
+
+    LEFT JOIN
+        `new-portfolio-1.PeopleU_B2B_Software_SaaS.sessions_source` AS s
+
+        ON l.session_source_code = s.session_source_code
+),
+
+customer_summary AS (
+
+    SELECT
+        leads_id,
+        total_observed_gmv AS lifecycle_gmv
+
+    FROM `new-portfolio-1.PeopleU_B2B_Software_SaaS.customer_360_table`
+),
+
+monthly_leads AS (
+
+    SELECT
+        acquisition_month AS cohort_month,
+        session_source,
+
+        COUNT(*) AS total_leads,
+
+        COUNTIF(
+            c.leads_id IS NOT NULL
+        ) AS contracted_leads,
+
+        SUM(
+            COALESCE(c.lifecycle_gmv, 0)
+        ) AS lifecycle_gmv
+
+    FROM lead_base AS l
+
+    LEFT JOIN customer_summary AS c
+
+        ON l.leads_id = c.leads_id
+
+    GROUP BY
+        acquisition_month,
+        session_source
+),
+
+monthly_panel AS (
+
+    SELECT
+        s.cohort_month,
+        s.session_source,
+
+        s.marketing_spend,
+
+        COALESCE(
+            m.total_leads,
+            0
+        ) AS total_leads,
+
+        COALESCE(
+            m.contracted_leads,
+            0
+        ) AS contracted_leads,
+
+        COALESCE(
+            m.lifecycle_gmv,
+            0
+        ) AS lifecycle_gmv
+
+    FROM spend_long AS s
+
+    LEFT JOIN monthly_leads AS m
+
+        ON s.cohort_month = m.cohort_month
+
+        AND s.session_source = m.session_source
+),
+
+changes AS (
+
+    SELECT
+        *,
+
+        LAG(marketing_spend) OVER (
+            PARTITION BY session_source
+            ORDER BY cohort_month
+        ) AS prev_spend,
+
+        LAG(total_leads) OVER (
+            PARTITION BY session_source
+            ORDER BY cohort_month
+        ) AS prev_leads,
+
+        LAG(contracted_leads) OVER (
+            PARTITION BY session_source
+            ORDER BY cohort_month
+        ) AS prev_contracts,
+
+        LAG(lifecycle_gmv) OVER (
+            PARTITION BY session_source
+            ORDER BY cohort_month
+        ) AS prev_lifecycle_gmv
+
+    FROM monthly_panel
+)
+
+SELECT
+    cohort_month,
+    session_source,
+
+    marketing_spend,
+    total_leads,
+    contracted_leads,
+    lifecycle_gmv,
+
+    -- ========================================================
+    -- Month-over-month percentage changes
+    -- ========================================================
+
+    ROUND(
+        100 * SAFE_DIVIDE(
+            marketing_spend - prev_spend,
+            prev_spend
+        ),
+        2
+    ) AS spend_change_pct,
+
+    ROUND(
+        100 * SAFE_DIVIDE(
+            total_leads - prev_leads,
+            prev_leads
+        ),
+        2
+    ) AS leads_change_pct,
+
+    ROUND(
+        100 * SAFE_DIVIDE(
+            contracted_leads - prev_contracts,
+            prev_contracts
+        ),
+        2
+    ) AS contracts_change_pct,
+
+    ROUND(
+        100 * SAFE_DIVIDE(
+            lifecycle_gmv - prev_lifecycle_gmv,
+            prev_lifecycle_gmv
+        ),
+        2
+    ) AS lifecycle_gmv_change_pct,
+
+    -- ========================================================
+    -- Observed elasticity:
+    -- % change in output / % change in spend
+    -- ========================================================
+
+    ROUND(
+        SAFE_DIVIDE(
+            SAFE_DIVIDE(
+                total_leads - prev_leads,
+                prev_leads
+            ),
+            SAFE_DIVIDE(
+                marketing_spend - prev_spend,
+                prev_spend
+            )
+        ),
+        2
+    ) AS observed_lead_elasticity,
+
+    ROUND(
+        SAFE_DIVIDE(
+            SAFE_DIVIDE(
+                contracted_leads - prev_contracts,
+                prev_contracts
+            ),
+            SAFE_DIVIDE(
+                marketing_spend - prev_spend,
+                prev_spend
+            )
+        ),
+        2
+    ) AS observed_contract_elasticity,
+
+    ROUND(
+        SAFE_DIVIDE(
+            SAFE_DIVIDE(
+                lifecycle_gmv - prev_lifecycle_gmv,
+                prev_lifecycle_gmv
+            ),
+            SAFE_DIVIDE(
+                marketing_spend - prev_spend,
+                prev_spend
+            )
+        ),
+        2
+    ) AS observed_gmv_elasticity
+
+FROM changes
+
+WHERE
+    prev_spend IS NOT NULL
+    AND prev_spend > 0
+
+ORDER BY
+    session_source,
+    cohort_month;
