@@ -1,0 +1,496 @@
+-- ============================================================
+-- SQL E — QUALIFIED LEAD SCORING & SEGMENTATION
+--
+-- Objective:
+-- Create an objective definition of Qualified Leads based on:
+-- 1. Conversion Quality
+-- 2. Initial Economic Quality
+-- 3. Lifecycle Economic Quality
+-- 4. Retention Quality
+--
+-- Unit of analysis:
+-- Employee Segment × Industry
+--
+-- Grain before aggregation = 1 row per leads_id
+-- ============================================================
+
+WITH lead_base AS (
+  SELECT DISTINCT 
+    l.leads_id, 
+    CASE 
+      WHEN l.number_of_employee <= 10 THEN '01. 1-10' 
+      WHEN l.number_of_employee <= 50 THEN '02. 11-50' 
+      WHEN l.number_of_employee <= 100 THEN '03. 51-100' 
+      WHEN l.number_of_employee <= 250 THEN '04. 101-250' 
+      ELSE '05. 251+' 
+    END AS employee_segment, 
+    i.industry
+  FROM `new-portfolio-1.PeopleU_B2B_Software_SaaS.leads` AS l
+  LEFT JOIN `new-portfolio-1.PeopleU_B2B_Software_SaaS.industries` i 
+    ON l.industry_code = i.industry_code
+), 
+
+customer_summary AS (
+  SELECT 
+    leads_id, 
+    first_gmv, 
+    total_observed_gmv AS lifecycle_gmv, 
+    renewed AS renewed_flag 
+  FROM `new-portfolio-1.PeopleU_B2B_Software_SaaS.customer_360_table`
+), 
+
+lead_level AS (
+  SELECT 
+    l.leads_id, 
+    l.employee_segment, 
+    l.industry, 
+    CASE WHEN c.leads_id IS NOT NULL THEN 1 ELSE 0 END AS converted_flag, 
+    COALESCE(c.first_gmv, 0) AS initial_gmv, 
+    COALESCE(c.lifecycle_gmv, 0) AS lifecycle_gmv, 
+    COALESCE(c.renewed_flag, 0) AS renewed_flag 
+  FROM lead_base AS l 
+  LEFT JOIN customer_summary AS c ON l.leads_id = c.leads_id
+), 
+
+segment_metrics AS (
+  SELECT 
+    employee_segment, 
+    industry, 
+    COUNT(*) AS total_leads, 
+    SUM(converted_flag) AS converted_leads, 
+    ROUND( 100 * SAFE_DIVIDE( SUM(converted_flag), COUNT(*) ), 2 ) AS conversion_rate_pct, 
+    ROUND( SAFE_DIVIDE( SUM(initial_gmv), COUNT(*) ), 2 ) AS initial_gmv_per_lead, 
+    ROUND( SAFE_DIVIDE( SUM(lifecycle_gmv), COUNT(*) ), 2 ) AS lifecycle_gmv_per_lead, 
+    ROUND( 100 * SAFE_DIVIDE( SUM(renewed_flag), SUM(converted_flag) ), 2 ) AS renewal_rate_pct 
+  FROM lead_level 
+  GROUP BY employee_segment, industry
+), 
+
+scored_segments AS (
+  SELECT *, 
+    ROUND( 100 * PERCENT_RANK() OVER ( ORDER BY conversion_rate_pct ), 2 ) AS conversion_score, 
+    ROUND( 100 * PERCENT_RANK() OVER ( ORDER BY initial_gmv_per_lead ), 2 ) AS initial_value_score, 
+    ROUND( 100 * PERCENT_RANK() OVER ( ORDER BY lifecycle_gmv_per_lead ), 2 ) AS lifecycle_value_score, 
+    ROUND( 100 * PERCENT_RANK() OVER ( ORDER BY renewal_rate_pct ), 2 ) AS retention_score 
+  FROM segment_metrics
+), 
+
+-- PERBAIKAN UTAMA: Mengubah nama CTE dari qualified_lead_score menjadi final_scored_data
+final_scored_data AS (
+  SELECT *, 
+    ROUND( conversion_score * 0.25 + initial_value_score * 0.25 + lifecycle_value_score * 0.30 + retention_score * 0.20, 2 ) AS qualified_lead_score 
+  FROM scored_segments
+) 
+
+-- ============================================================
+-- FINAL OUTPUT
+-- ============================================================
+SELECT 
+  employee_segment, 
+  industry, 
+  total_leads, 
+  converted_leads, 
+  conversion_rate_pct, 
+  initial_gmv_per_lead, 
+  lifecycle_gmv_per_lead, 
+  renewal_rate_pct, 
+  conversion_score, 
+  initial_value_score, 
+  lifecycle_value_score, 
+  retention_score, 
+  qualified_lead_score, 
+  
+  -- Sekarang fungsi perbandingan di bawah ini dijamin aman dan terbaca sebagai kolom angka biasa
+  CASE 
+    WHEN total_leads >= 30 AND qualified_lead_score >= 75 THEN 'Tier 1 - High Priority' 
+    WHEN total_leads >= 20 AND qualified_lead_score >= 55 THEN 'Tier 2 - Growth Opportunity' 
+    WHEN qualified_lead_score >= 40 THEN 'Tier 3 - Monitor' 
+    ELSE 'Tier 4 - Low Priority' 
+  END AS qualified_lead_tier, 
+  
+  CASE 
+    WHEN total_leads < 20 THEN 'Small Sample - Validate Before Scaling' 
+    WHEN conversion_score >= 60 AND lifecycle_value_score >= 60 AND retention_score >= 60 THEN 'High-Quality Scalable Segment' 
+    WHEN conversion_score < 40 AND lifecycle_value_score >= 60 THEN 'High Value but Conversion Challenge' 
+    WHEN conversion_score >= 60 AND lifecycle_value_score < 40 THEN 'Easy Conversion but Lower Economic Value' 
+    WHEN conversion_score < 40 AND lifecycle_value_score < 40 THEN 'Low Conversion and Low Value' 
+    ELSE 'Mixed Performance - Optimize Selectively' 
+  END AS strategic_interpretation 
+FROM final_scored_data 
+ORDER BY 
+  CASE WHEN total_leads >= 30 THEN 1 ELSE 2 END, 
+  qualified_lead_score DESC;
+
+
+-- ============================================================
+-- SQL F-3 — CONFIDENCE-ADJUSTED / EVIDENCE-STRENGTH VALIDATION
+-- ============================================================
+-- Business Objective:
+-- Validate whether high-quality lead segments are supported
+-- by sufficient evidence before making marketing decisions.
+--
+-- Grain:
+-- 1 row = 1 leads_id
+-- ============================================================
+
+WITH lead_base AS (
+  SELECT DISTINCT
+    l.leads_id,
+    
+    CASE
+      WHEN l.number_of_employee <= 10 THEN '01. 1-10'
+      WHEN l.number_of_employee <= 50 THEN '02. 11-50'
+      WHEN l.number_of_employee <= 100 THEN '03. 51-100'
+      WHEN l.number_of_employee <= 250 THEN '04. 101-250'
+      ELSE '05. 251+'
+    END AS employee_segment,
+    
+    i.industry
+    
+  FROM `new-portfolio-1.PeopleU_B2B_Software_SaaS.leads` AS l
+  
+  LEFT JOIN `new-portfolio-1.PeopleU_B2B_Software_SaaS.industries` AS i
+    ON l.industry_code = i.industry_code
+),
+
+customer_summary AS (
+  SELECT
+    leads_id,
+    contract_count,
+    first_gmv,
+    renewal_gmv,
+    total_observed_gmv AS lifecycle_gmv,
+    renewed
+  FROM `new-portfolio-1.PeopleU_B2B_Software_SaaS.customer_360_table`
+),
+
+lead_level AS (
+  SELECT
+    l.leads_id,
+    l.employee_segment,
+    l.industry,
+    
+    CASE
+      WHEN c.leads_id IS NOT NULL THEN 1
+      ELSE 0
+    END AS converted_flag,
+    
+    COALESCE(c.first_gmv, 0) AS first_gmv,
+    COALESCE(c.lifecycle_gmv, 0) AS lifecycle_gmv,
+    COALESCE(c.renewed, 0) AS renewed_flag
+    
+  FROM lead_base AS l
+  
+  LEFT JOIN customer_summary AS c
+    ON l.leads_id = c.leads_id
+),
+
+-- ============================================================
+-- 1. SEGMENT RAW PERFORMANCE
+-- ============================================================
+
+segment_performance AS (
+  SELECT
+    employee_segment,
+    industry,
+    
+    COUNT(*) AS total_leads,
+    SUM(converted_flag) AS contracted_leads,
+    
+    SAFE_DIVIDE(
+      SUM(converted_flag),
+      COUNT(*)
+    ) AS raw_conversion_rate,
+    
+    SAFE_DIVIDE(
+      SUM(first_gmv),
+      COUNT(*)
+    ) AS raw_initial_gmv_per_lead,
+    
+    SAFE_DIVIDE(
+      SUM(lifecycle_gmv),
+      COUNT(*)
+    ) AS raw_lifecycle_gmv_per_lead,
+    
+    SAFE_DIVIDE(
+      SUM(renewed_flag),
+      SUM(converted_flag)
+    ) AS raw_renewal_rate
+    
+  FROM lead_level
+  
+  GROUP BY
+    employee_segment,
+    industry
+),
+
+-- ============================================================
+-- 2. OVERALL BASELINE
+-- Used as the population benchmark for shrinkage
+-- ============================================================
+
+overall_baseline AS (
+  SELECT
+    COUNT(*) AS overall_leads,
+    
+    SAFE_DIVIDE(
+      SUM(converted_flag),
+      COUNT(*)
+    ) AS overall_conversion_rate,
+    
+    SAFE_DIVIDE(
+      SUM(first_gmv),
+      COUNT(*)
+    ) AS overall_initial_gmv_per_lead,
+    
+    SAFE_DIVIDE(
+      SUM(lifecycle_gmv),
+      COUNT(*)
+    ) AS overall_lifecycle_gmv_per_lead,
+    
+    SAFE_DIVIDE(
+      SUM(renewed_flag),
+      SUM(converted_flag)
+    ) AS overall_renewal_rate
+    
+  FROM lead_level
+),
+
+-- ============================================================
+-- 3. CONFIDENCE-ADJUSTED PERFORMANCE
+--
+-- k = 30
+-- Segments with small sample sizes are partially shrunk
+-- toward the overall baseline.
+--
+-- Weight = total_leads / (total_leads + 30)
+-- ============================================================
+
+confidence_adjusted AS (
+  SELECT
+    s.*,
+    
+    b.overall_conversion_rate,
+    b.overall_initial_gmv_per_lead,
+    b.overall_lifecycle_gmv_per_lead,
+    b.overall_renewal_rate,
+    
+    ROUND(
+      SAFE_DIVIDE(
+        s.total_leads,
+        s.total_leads + 30
+      ),
+      4
+    ) AS evidence_weight,
+    
+    -- Conversion adjusted by evidence strength
+    (
+      SAFE_DIVIDE(
+        s.total_leads,
+        s.total_leads + 30
+      ) * s.raw_conversion_rate
+    )
+    +
+    (
+      SAFE_DIVIDE(
+        30,
+        s.total_leads + 30
+      ) * b.overall_conversion_rate
+    ) AS adjusted_conversion_rate,
+    
+    -- Initial GMV per Lead adjusted by evidence strength
+    (
+      SAFE_DIVIDE(
+        s.total_leads,
+        s.total_leads + 30
+      ) * s.raw_initial_gmv_per_lead
+    )
+    +
+    (
+      SAFE_DIVIDE(
+        30,
+        s.total_leads + 30
+      ) * b.overall_initial_gmv_per_lead
+    ) AS adjusted_initial_gmv_per_lead,
+    
+    -- Lifecycle GMV per Lead adjusted by evidence strength
+    (
+      SAFE_DIVIDE(
+        s.total_leads,
+        s.total_leads + 30
+      ) * s.raw_lifecycle_gmv_per_lead
+    )
+    +
+    (
+      SAFE_DIVIDE(
+        30,
+        s.total_leads + 30
+      ) * b.overall_lifecycle_gmv_per_lead
+    ) AS adjusted_lifecycle_gmv_per_lead,
+    
+    -- Renewal adjusted separately
+    -- still treated as a secondary quality indicator
+    (
+      SAFE_DIVIDE(
+        s.total_leads,
+        s.total_leads + 30
+      ) * s.raw_renewal_rate
+    )
+    +
+    (
+      SAFE_DIVIDE(
+        30,
+        s.total_leads + 30
+      ) * b.overall_renewal_rate
+    ) AS adjusted_renewal_rate
+    
+  FROM segment_performance AS s
+  CROSS JOIN overall_baseline AS b
+),
+
+-- ============================================================
+-- 4. NORMALIZE ADJUSTED METRICS
+-- ============================================================
+
+score_range AS (
+  SELECT
+    *,
+    
+    MIN(adjusted_conversion_rate) OVER () AS min_conversion,
+    MAX(adjusted_conversion_rate) OVER () AS max_conversion,
+    
+    MIN(adjusted_initial_gmv_per_lead) OVER () AS min_initial_value,
+    MAX(adjusted_initial_gmv_per_lead) OVER () AS max_initial_value,
+    
+    MIN(adjusted_lifecycle_gmv_per_lead) OVER () AS min_lifecycle_value,
+    MAX(adjusted_lifecycle_gmv_per_lead) OVER () AS max_lifecycle_value,
+    
+    MIN(adjusted_renewal_rate) OVER () AS min_renewal,
+    MAX(adjusted_renewal_rate) OVER () AS max_renewal
+    
+  FROM confidence_adjusted
+),
+
+-- ============================================================
+-- 5. CONFIDENCE-ADJUSTED QUALIFIED LEAD SCORE
+-- ============================================================
+
+final_scoring AS (
+  SELECT
+    *,
+    
+    ROUND(
+      100 * SAFE_DIVIDE(
+        adjusted_conversion_rate - min_conversion,
+        max_conversion - min_conversion
+      ),
+      2
+    ) AS adjusted_conversion_score,
+    
+    ROUND(
+      100 * SAFE_DIVIDE(
+        adjusted_initial_gmv_per_lead - min_initial_value,
+        max_initial_value - min_initial_value
+      ),
+      2
+    ) AS adjusted_initial_value_score,
+    
+    ROUND(
+      100 * SAFE_DIVIDE(
+        adjusted_lifecycle_gmv_per_lead - min_lifecycle_value,
+        max_lifecycle_value - min_lifecycle_value
+      ),
+      2
+    ) AS adjusted_lifecycle_score,
+    
+    ROUND(
+      100 * SAFE_DIVIDE(
+        adjusted_renewal_rate - min_renewal,
+        max_renewal - min_renewal
+      ),
+      2
+    ) AS adjusted_renewal_score
+    
+  FROM score_range
+),
+
+-- ============================================================
+-- 6. FINAL PRIORITY CLASSIFICATION
+-- ============================================================
+
+priority_validation AS (
+  SELECT
+    *,
+    
+    ROUND(
+        adjusted_conversion_score * 0.30
+      + adjusted_initial_value_score * 0.25
+      + adjusted_lifecycle_score * 0.30
+      + adjusted_renewal_score * 0.15,
+      2
+    ) AS confidence_adjusted_score
+    
+  FROM final_scoring
+)
+
+SELECT
+  employee_segment,
+  industry,
+  
+  total_leads,
+  contracted_leads,
+  
+  -- Evidence
+  evidence_weight,
+  
+  CASE
+    WHEN total_leads >= 50 THEN 'High Evidence'
+    WHEN total_leads >= 30 THEN 'Moderate Evidence'
+    WHEN total_leads >= 15 THEN 'Limited Evidence'
+    ELSE 'Low Evidence'
+  END AS evidence_strength,
+  
+  -- Raw performance
+  ROUND(100 * raw_conversion_rate, 2) AS raw_conversion_rate_pct,
+  ROUND(raw_initial_gmv_per_lead, 0) AS raw_initial_gmv_per_lead,
+  ROUND(raw_lifecycle_gmv_per_lead, 0) AS raw_lifecycle_gmv_per_lead,
+  ROUND(100 * raw_renewal_rate, 2) AS raw_renewal_rate_pct,
+  
+  -- Confidence-adjusted performance
+  ROUND(100 * adjusted_conversion_rate, 2)
+    AS adjusted_conversion_rate_pct,
+    
+  ROUND(adjusted_initial_gmv_per_lead, 0)
+    AS adjusted_initial_gmv_per_lead,
+    
+  ROUND(adjusted_lifecycle_gmv_per_lead, 0)
+    AS adjusted_lifecycle_gmv_per_lead,
+    
+  ROUND(100 * adjusted_renewal_rate, 2)
+    AS adjusted_renewal_rate_pct,
+  
+  -- Final score
+  confidence_adjusted_score,
+  
+  -- Decision-oriented classification
+  CASE
+    WHEN confidence_adjusted_score >= 70
+         AND total_leads >= 30
+      THEN 'Priority 1 - Scale'
+      
+    WHEN confidence_adjusted_score >= 55
+         AND total_leads >= 15
+      THEN 'Priority 2 - Optimize'
+      
+    WHEN confidence_adjusted_score >= 45
+         OR total_leads >= 15
+      THEN 'Priority 3 - Selective Test'
+      
+    ELSE 'Priority 4 - Deprioritize'
+  END AS recommended_priority
+
+FROM priority_validation
+
+ORDER BY
+  confidence_adjusted_score DESC,
+  total_leads DESC;
