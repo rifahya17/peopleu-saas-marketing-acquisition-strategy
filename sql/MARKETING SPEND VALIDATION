@@ -1,0 +1,12 @@
+-- 11. MARKETING SPEND VALIDATION
+-- ============================================================
+-- MSA-1 — MARKETING SPEND DATA AVAILABILITY AUDIT
+-- Inventory seluruh tabel dalam PeopleU dataset
+-- ============================================================
+
+SELECT
+    table_name,
+    table_type
+FROM `new-portfolio-1.PeopleU_B2B_Software_SaaS.INFORMATION_SCHEMA.TABLES`
+ORDER BY
+    table_name;
