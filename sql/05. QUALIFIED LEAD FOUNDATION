@@ -1,0 +1,89 @@
+-- =========================================================
+-- SQL A0 — QUALIFIED LEAD FOUNDATION AUDIT
+-- Purpose:
+-- Validate the Lead → Contract funnel before lead segmentation
+-- =========================================================
+
+WITH lead_base AS (
+    SELECT
+        leads_id
+    FROM `new-portfolio-1.PeopleU_B2B_Software_SaaS.leads`
+),
+
+contract_base AS (
+    SELECT
+        leads_id,
+        COUNT(*) AS contract_count
+    FROM `new-portfolio-1.PeopleU_B2B_Software_SaaS.contract`
+    GROUP BY leads_id
+),
+
+lead_contract_status AS (
+    SELECT
+        l.leads_id,
+
+        CASE
+            WHEN c.leads_id IS NOT NULL THEN 1
+            ELSE 0
+        END AS has_contract,
+
+        COALESCE(c.contract_count, 0) AS contract_count
+
+    FROM lead_base l
+    LEFT JOIN contract_base c
+        ON l.leads_id = c.leads_id
+),
+
+contract_matching_audit AS (
+    SELECT
+        COUNT(*) AS total_contract_rows,
+
+        COUNT(DISTINCT c.leads_id) AS unique_contracted_leads,
+
+        COUNTIF(l.leads_id IS NULL) AS contracts_without_matching_lead
+
+    FROM `new-portfolio-1.PeopleU_B2B_Software_SaaS.contract` c
+    LEFT JOIN lead_base l
+        ON c.leads_id = l.leads_id
+)
+
+SELECT
+
+    -- Lead Population
+    COUNT(DISTINCT leads_id) AS total_unique_leads,
+
+    -- Conversion
+    COUNTIF(has_contract = 1) AS contracted_leads,
+
+    COUNTIF(has_contract = 0) AS leads_without_contract,
+
+    ROUND(
+        SAFE_DIVIDE(
+            COUNTIF(has_contract = 1),
+            COUNT(DISTINCT leads_id)
+        ) * 100,
+        2
+    ) AS lead_to_contract_rate_pct,
+
+    -- Contract Relationship
+    COUNTIF(contract_count > 1) AS leads_with_multiple_contracts,
+
+    MAX(contract_count) AS max_contracts_per_lead,
+
+    -- Contract Matching Validation
+    (
+        SELECT total_contract_rows
+        FROM contract_matching_audit
+    ) AS total_contract_rows,
+
+    (
+        SELECT unique_contracted_leads
+        FROM contract_matching_audit
+    ) AS unique_contracted_leads,
+
+    (
+        SELECT contracts_without_matching_lead
+        FROM contract_matching_audit
+    ) AS contracts_without_matching_lead
+
+FROM lead_contract_status;
