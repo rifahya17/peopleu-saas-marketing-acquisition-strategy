@@ -1,0 +1,623 @@
+-- ============================================================
+-- SQL H1-B
+-- PRIORITY SEGMENT × ACQUISITION CHANNEL × LEAD INTENT
+-- ============================================================
+--
+-- Business Objective:
+-- Identify the strongest acquisition "motions":
+--
+-- WHO  = Employee Segment × Industry
+-- WHERE = Acquisition Channel
+-- HOW READY = Pre-Registration Intent
+--
+-- Final grain:
+-- 1 row = Employee Segment × Industry × Channel × Intent
+--
+-- IMPORTANT:
+-- Intent is inferred from Google Analytics pages observed
+-- BEFORE the lead registration timestamp.
+-- ============================================================
+
+
+-- ============================================================
+-- 1. LEAD BASE
+-- ============================================================
+
+WITH lead_base AS (
+
+    SELECT DISTINCT
+        l.leads_id,
+        l.leads_registered,
+
+        s.session_source,
+
+        CASE
+            WHEN l.number_of_employee <= 10 THEN '01. 1-10'
+            WHEN l.number_of_employee <= 50 THEN '02. 11-50'
+            WHEN l.number_of_employee <= 100 THEN '03. 51-100'
+            WHEN l.number_of_employee <= 250 THEN '04. 101-250'
+            ELSE '05. 251+'
+        END AS employee_segment,
+
+        i.industry
+
+    FROM `new-portfolio-1.PeopleU_B2B_Software_SaaS.leads` AS l
+
+    LEFT JOIN
+        `new-portfolio-1.PeopleU_B2B_Software_SaaS.sessions_source` AS s
+        ON l.session_source_code = s.session_source_code
+
+    LEFT JOIN
+        `new-portfolio-1.PeopleU_B2B_Software_SaaS.industries` AS i
+        ON l.industry_code = i.industry_code
+),
+
+
+-- ============================================================
+-- 2. GOOGLE ANALYTICS → PRE-REGISTRATION INTENT
+--
+-- Priority:
+-- Set a Meeting > Demo > Brochure
+-- ============================================================
+
+page_intent AS (
+
+    SELECT
+        g.leads_id,
+        g.Page_Name,
+        g.Page_timestamp,
+
+        CASE
+
+            WHEN g.Page_Name = '/form/set-a-meeting'
+                THEN 3
+
+            WHEN g.Page_Name = '/form/demo'
+                THEN 2
+
+            WHEN g.Page_Name = '/form/brochure'
+                THEN 1
+
+            ELSE 0
+
+        END AS intent_score
+
+    FROM
+        `new-portfolio-1.PeopleU_B2B_Software_SaaS.google_analytics_clean` AS g
+),
+
+
+-- ============================================================
+-- 3. KEEP ONLY PAGE VISITS BEFORE LEAD REGISTRATION
+-- ============================================================
+
+pre_registration_intent AS (
+
+    SELECT
+        p.leads_id,
+        p.intent_score
+
+    FROM page_intent AS p
+
+    INNER JOIN lead_base AS l
+        ON p.leads_id = l.leads_id
+
+    WHERE
+        p.Page_timestamp <= l.leads_registered
+),
+
+
+-- ============================================================
+-- 4. ONE FINAL INTENT PER LEAD
+-- Highest observed intent before registration
+-- ============================================================
+
+lead_intent AS (
+
+    SELECT
+        l.leads_id,
+
+        COALESCE(
+            MAX(p.intent_score),
+            0
+        ) AS max_intent_score
+
+    FROM lead_base AS l
+
+    LEFT JOIN pre_registration_intent AS p
+        ON l.leads_id = p.leads_id
+
+    GROUP BY
+        l.leads_id
+),
+
+
+lead_intent_labeled AS (
+
+    SELECT
+        leads_id,
+
+        CASE
+            WHEN max_intent_score = 3
+                THEN 'High Intent - Set a Meeting'
+
+            WHEN max_intent_score = 2
+                THEN 'Medium Intent - Demo'
+
+            WHEN max_intent_score = 1
+                THEN 'Low Intent - Brochure'
+
+            ELSE 'Unknown / No Tracked Intent'
+
+        END AS lead_intent
+
+    FROM lead_intent
+),
+
+
+-- ============================================================
+-- 5. CUSTOMER 360
+-- 1 row = 1 leads_id
+-- ============================================================
+
+customer_summary AS (
+
+    SELECT
+        leads_id,
+        first_gmv,
+        total_observed_gmv AS lifecycle_gmv,
+        renewed
+
+    FROM
+        `new-portfolio-1.PeopleU_B2B_Software_SaaS.customer_360_table`
+),
+
+
+-- ============================================================
+-- 6. LEAD-LEVEL MASTER
+-- Exactly 1 row per leads_id
+-- ============================================================
+
+lead_level AS (
+
+    SELECT
+
+        l.leads_id,
+        l.session_source,
+        l.employee_segment,
+        l.industry,
+
+        COALESCE(
+            i.lead_intent,
+            'Unknown / No Tracked Intent'
+        ) AS lead_intent,
+
+        CASE
+            WHEN c.leads_id IS NOT NULL
+                THEN 1
+            ELSE 0
+        END AS converted_flag,
+
+        COALESCE(c.first_gmv, 0) AS first_gmv,
+
+        COALESCE(c.lifecycle_gmv, 0) AS lifecycle_gmv,
+
+        COALESCE(c.renewed, 0) AS renewed_flag
+
+    FROM lead_base AS l
+
+    LEFT JOIN lead_intent_labeled AS i
+        ON l.leads_id = i.leads_id
+
+    LEFT JOIN customer_summary AS c
+        ON l.leads_id = c.leads_id
+),
+
+
+-- ============================================================
+-- 7. SEGMENT RAW PERFORMANCE
+-- Used as benchmark for WHO
+-- ============================================================
+
+segment_performance AS (
+
+    SELECT
+
+        employee_segment,
+        industry,
+
+        COUNT(*) AS segment_total_leads,
+
+        SUM(converted_flag) AS segment_contracted_leads,
+
+        SAFE_DIVIDE(
+            SUM(converted_flag),
+            COUNT(*)
+        ) AS segment_conversion_rate,
+
+        SAFE_DIVIDE(
+            SUM(first_gmv),
+            COUNT(*)
+        ) AS segment_initial_gmv_per_lead,
+
+        SAFE_DIVIDE(
+            SUM(lifecycle_gmv),
+            COUNT(*)
+        ) AS segment_lifecycle_gmv_per_lead,
+
+        SAFE_DIVIDE(
+            SUM(renewed_flag),
+            SUM(converted_flag)
+        ) AS segment_renewal_rate
+
+    FROM lead_level
+
+    GROUP BY
+        employee_segment,
+        industry
+),
+
+
+-- ============================================================
+-- 8. CHANNEL × SEGMENT × INTENT PERFORMANCE
+-- ============================================================
+
+motion_performance AS (
+
+    SELECT
+
+        employee_segment,
+        industry,
+        session_source,
+        lead_intent,
+
+        COUNT(*) AS motion_leads,
+
+        SUM(converted_flag) AS motion_contracted_leads,
+
+        SAFE_DIVIDE(
+            SUM(converted_flag),
+            COUNT(*)
+        ) AS motion_conversion_rate,
+
+        SAFE_DIVIDE(
+            SUM(first_gmv),
+            COUNT(*)
+        ) AS motion_initial_gmv_per_lead,
+
+        SAFE_DIVIDE(
+            SUM(lifecycle_gmv),
+            COUNT(*)
+        ) AS motion_lifecycle_gmv_per_lead,
+
+        SAFE_DIVIDE(
+            SUM(lifecycle_gmv),
+            SUM(converted_flag)
+        ) AS motion_lifecycle_gmv_per_converted_lead,
+
+        SAFE_DIVIDE(
+            SUM(renewed_flag),
+            SUM(converted_flag)
+        ) AS motion_renewal_rate
+
+    FROM lead_level
+
+    GROUP BY
+
+        employee_segment,
+        industry,
+        session_source,
+        lead_intent
+),
+
+
+-- ============================================================
+-- 9. COMPARE MOTION AGAINST SEGMENT BASELINE
+-- ============================================================
+
+motion_benchmark AS (
+
+    SELECT
+
+        m.*,
+
+        s.segment_total_leads,
+        s.segment_contracted_leads,
+
+        s.segment_conversion_rate,
+        s.segment_initial_gmv_per_lead,
+        s.segment_lifecycle_gmv_per_lead,
+        s.segment_renewal_rate,
+
+        SAFE_DIVIDE(
+            m.motion_conversion_rate,
+            s.segment_conversion_rate
+        ) AS conversion_index,
+
+        SAFE_DIVIDE(
+            m.motion_lifecycle_gmv_per_lead,
+            s.segment_lifecycle_gmv_per_lead
+        ) AS lifecycle_value_index,
+
+        SAFE_DIVIDE(
+            m.motion_leads,
+            s.segment_total_leads
+        ) AS motion_share_of_segment
+
+    FROM motion_performance AS m
+
+    LEFT JOIN segment_performance AS s
+
+        ON m.employee_segment = s.employee_segment
+        AND m.industry = s.industry
+),
+
+
+-- ============================================================
+-- 10. EVIDENCE STRENGTH
+-- ============================================================
+
+motion_evidence AS (
+
+    SELECT
+        *,
+
+        CASE
+
+            WHEN motion_leads >= 50
+                THEN 'High Evidence'
+
+            WHEN motion_leads >= 30
+                THEN 'Moderate Evidence'
+
+            WHEN motion_leads >= 15
+                THEN 'Limited Evidence'
+
+            ELSE 'Low Evidence'
+
+        END AS evidence_strength
+
+    FROM motion_benchmark
+),
+
+
+-- ============================================================
+-- 11. PRIORITY SEGMENT
+--
+-- We use the SAME BUSINESS THRESHOLD FRAMEWORK as F-3.
+-- This is NOT a new scoring system.
+--
+-- The priority here is based on the evidence-adjusted
+-- segment quality logic already established earlier.
+-- ============================================================
+
+segment_priority AS (
+
+    SELECT
+        employee_segment,
+        industry,
+
+        CASE
+
+            -- Core Scale
+            WHEN segment_total_leads >= 30
+                 AND segment_conversion_rate >= 0.30
+                 AND segment_lifecycle_gmv_per_lead >= 2000000
+            THEN 'Priority 1 - Core Target'
+
+            -- Growth Opportunity
+            WHEN segment_total_leads >= 30
+                 AND (
+                     segment_conversion_rate >= 0.25
+                     OR segment_lifecycle_gmv_per_lead >= 1500000
+                 )
+            THEN 'Priority 2 - Growth Target'
+
+            -- Smaller / Emerging
+            WHEN segment_total_leads >= 15
+            THEN 'Priority 3 - Selective Target'
+
+            ELSE 'Priority 4 - Low Priority'
+
+        END AS target_priority
+
+    FROM segment_performance
+),
+
+
+-- ============================================================
+-- 12. FINAL MOTION CLASSIFICATION
+-- ============================================================
+
+final_motion AS (
+
+    SELECT
+
+        m.*,
+
+        p.target_priority,
+
+        CASE
+
+            -- ==================================================
+            -- CORE ACQUISITION MOTION
+            -- High-priority audience
+            -- + sufficient channel evidence
+            -- + above segment benchmark in both conversion
+            --   and lifecycle value
+            -- ==================================================
+
+            WHEN p.target_priority = 'Priority 1 - Core Target'
+                 AND m.motion_leads >= 30
+                 AND m.conversion_index >= 1
+                 AND m.lifecycle_value_index >= 1
+            THEN 'CORE ACQUISITION MOTION'
+
+
+            -- ==================================================
+            -- EXPANSION MOTION
+            -- Good target + evidence sufficient
+            -- ==================================================
+
+            WHEN p.target_priority IN (
+                     'Priority 1 - Core Target',
+                     'Priority 2 - Growth Target'
+                 )
+                 AND m.motion_leads >= 15
+                 AND m.conversion_index >= 1
+                 AND m.lifecycle_value_index >= 1
+            THEN 'EXPANSION MOTION'
+
+
+            -- ==================================================
+            -- CONTROLLED TEST
+            -- Strong signal but insufficient evidence
+            -- ==================================================
+
+            WHEN p.target_priority IN (
+                     'Priority 1 - Core Target',
+                     'Priority 2 - Growth Target',
+                     'Priority 3 - Selective Target'
+                 )
+                 AND m.conversion_index >= 1
+                 AND m.lifecycle_value_index >= 1
+                 AND m.motion_leads < 15
+            THEN 'CONTROLLED TEST'
+
+
+            -- ==================================================
+            -- OPTIMIZE
+            -- One dimension strong, one weak
+            -- ==================================================
+
+            WHEN m.conversion_index >= 1
+                 OR m.lifecycle_value_index >= 1
+            THEN 'OPTIMIZE'
+
+
+            -- ==================================================
+            -- DEPRIORITIZE
+            -- Sufficient evidence + weak on both dimensions
+            -- ==================================================
+
+            WHEN m.motion_leads >= 15
+                 AND m.conversion_index < 1
+                 AND m.lifecycle_value_index < 1
+            THEN 'DEPRIORITIZE'
+
+
+            ELSE 'NURTURE / MONITOR'
+
+        END AS acquisition_motion
+
+
+    FROM motion_evidence AS m
+
+    LEFT JOIN segment_priority AS p
+
+        ON m.employee_segment = p.employee_segment
+        AND m.industry = p.industry
+)
+
+
+-- ============================================================
+-- FINAL MANAGEMENT-READY OUTPUT
+-- ============================================================
+
+SELECT
+
+    target_priority,
+
+    employee_segment,
+    industry,
+    session_source AS acquisition_channel,
+
+    lead_intent,
+
+    acquisition_motion,
+
+    -- Evidence
+    motion_leads,
+    motion_contracted_leads,
+    evidence_strength,
+
+    -- Conversion
+    ROUND(
+        100 * motion_conversion_rate,
+        2
+    ) AS conversion_rate_pct,
+
+    -- Economic value
+    ROUND(
+        motion_initial_gmv_per_lead,
+        0
+    ) AS initial_gmv_per_lead,
+
+    ROUND(
+        motion_lifecycle_gmv_per_lead,
+        0
+    ) AS lifecycle_gmv_per_lead,
+
+    ROUND(
+        motion_lifecycle_gmv_per_converted_lead,
+        0
+    ) AS lifecycle_gmv_per_converted_lead,
+
+    -- Renewal
+    ROUND(
+        100 * motion_renewal_rate,
+        2
+    ) AS renewal_rate_pct,
+
+    -- Benchmark
+    ROUND(
+        conversion_index,
+        2
+    ) AS conversion_index_vs_segment,
+
+    ROUND(
+        lifecycle_value_index,
+        2
+    ) AS lifecycle_value_index_vs_segment,
+
+    ROUND(
+        100 * motion_share_of_segment,
+        2
+    ) AS motion_share_of_segment_pct,
+
+    -- Segment context
+    segment_total_leads,
+    segment_contracted_leads,
+
+    ROUND(
+        100 * segment_conversion_rate,
+        2
+    ) AS segment_conversion_rate_pct,
+
+    ROUND(
+        segment_lifecycle_gmv_per_lead,
+        0
+    ) AS segment_lifecycle_gmv_per_lead
+
+FROM final_motion
+
+ORDER BY
+
+    CASE target_priority
+        WHEN 'Priority 1 - Core Target' THEN 1
+        WHEN 'Priority 2 - Growth Target' THEN 2
+        WHEN 'Priority 3 - Selective Target' THEN 3
+        ELSE 4
+    END,
+
+    CASE acquisition_motion
+        WHEN 'CORE ACQUISITION MOTION' THEN 1
+        WHEN 'EXPANSION MOTION' THEN 2
+        WHEN 'CONTROLLED TEST' THEN 3
+        WHEN 'OPTIMIZE' THEN 4
+        WHEN 'DEPRIORITIZE' THEN 5
+        ELSE 6
+    END,
+
+    motion_lifecycle_gmv_per_lead DESC,
+    motion_leads DESC;
