@@ -1,0 +1,295 @@
+-- ============================================================
+-- SQL #20B
+-- MONTHLY CONTRACT-BASED COHORT RETENTION
+--
+-- Purpose:
+-- Measure customer contract activity/renewal by months
+-- since the customer's first contract month
+-- ============================================================
+
+WITH customer_cohort AS (
+
+  -- Determine each customer's first contract month
+  SELECT
+    leads_id,
+    DATE_TRUNC(MIN(date), MONTH) AS cohort_month
+  FROM `new-portfolio-1.PeopleU_B2B_Software_SaaS.contract`
+  GROUP BY leads_id
+
+),
+
+customer_activity AS (
+
+  -- One customer counted once per activity month
+  SELECT DISTINCT
+    leads_id,
+    DATE_TRUNC(date, MONTH) AS activity_month
+  FROM `new-portfolio-1.PeopleU_B2B_Software_SaaS.contract`
+
+),
+
+cohort_activity AS (
+
+  SELECT
+    cc.cohort_month,
+    ca.activity_month,
+
+    DATE_DIFF(
+      ca.activity_month,
+      cc.cohort_month,
+      MONTH
+    ) AS months_since_cohort,
+
+    ca.leads_id
+
+  FROM customer_cohort cc
+  INNER JOIN customer_activity ca
+    ON cc.leads_id = ca.leads_id
+
+),
+
+cohort_size AS (
+
+  SELECT
+    cohort_month,
+    COUNT(DISTINCT leads_id) AS cohort_customers
+  FROM customer_cohort
+  GROUP BY cohort_month
+
+)
+
+SELECT
+  ca.cohort_month,
+  ca.months_since_cohort,
+
+  cs.cohort_customers,
+
+  COUNT(DISTINCT ca.leads_id) AS active_customers,
+
+  ROUND(
+    SAFE_DIVIDE(
+      COUNT(DISTINCT ca.leads_id),
+      cs.cohort_customers
+    ) * 100,
+    2
+  ) AS retention_rate_pct
+
+FROM cohort_activity ca
+
+INNER JOIN cohort_size cs
+  ON ca.cohort_month = cs.cohort_month
+
+GROUP BY
+  ca.cohort_month,
+  ca.months_since_cohort,
+  cs.cohort_customers
+
+ORDER BY
+  ca.cohort_month,
+  ca.months_since_cohort;
+
+-- =========================================================
+-- SQL #20C — Cohort Quality × Customer Retention × GMV Quality
+-- =========================================================
+
+WITH cohort_base AS (
+  SELECT
+    DATE_TRUNC(first_contract_date, MONTH) AS cohort_month,
+    renewed,
+    first_gmv,
+    renewal_gmv
+  FROM `new-portfolio-1.PeopleU_B2B_Software_SaaS.customer_360_table`
+)
+
+SELECT
+  cohort_month,
+
+  -- =======================================================
+  -- 1. COHORT SIZE
+  -- =======================================================
+  COUNT(*) AS cohort_customers,
+
+  -- =======================================================
+  -- 2. CUSTOMER RETENTION QUALITY
+  -- =======================================================
+  COUNTIF(renewed = 1) AS renewed_customers,
+  COUNTIF(renewed = 0) AS churned_customers,
+
+  ROUND(
+    SAFE_DIVIDE(
+      COUNTIF(renewed = 1),
+      COUNT(*)
+    ) * 100,
+    2
+  ) AS customer_retention_pct,
+
+  -- =======================================================
+  -- 3. GMV / REVENUE QUALITY
+  -- =======================================================
+  SUM(first_gmv) AS total_initial_gmv,
+
+  SUM(
+    CASE
+      WHEN renewed = 1 THEN renewal_gmv
+      ELSE 0
+    END
+  ) AS total_renewal_gmv,
+
+  -- =======================================================
+  -- GMV RETENTION
+  -- =======================================================
+  ROUND(
+    SAFE_DIVIDE(
+      SUM(
+        CASE
+          WHEN renewed = 1 THEN renewal_gmv
+          ELSE 0
+        END
+      ),
+      SUM(first_gmv)
+    ) * 100,
+    2
+  ) AS gmv_retention_pct,
+
+  -- =======================================================
+  -- GMV CHANGE
+  -- =======================================================
+  SUM(
+    CASE
+      WHEN renewed = 1 THEN renewal_gmv
+      ELSE 0
+    END
+  ) - SUM(first_gmv) AS total_gmv_change,
+
+  ROUND(
+    SAFE_DIVIDE(
+      SUM(
+        CASE
+          WHEN renewed = 1 THEN renewal_gmv
+          ELSE 0
+        END
+      ) - SUM(first_gmv),
+      SUM(first_gmv)
+    ) * 100,
+    2
+  ) AS gmv_change_pct
+
+FROM cohort_base
+
+GROUP BY cohort_month
+
+ORDER BY cohort_month;
+
+-- ============================================================
+-- SQL #20D — Cohort Seasonality Analysis by First Contract Month
+-- Objective:
+-- Identify whether the MONTH of first customer acquisition
+-- shows recurring patterns in:
+-- 1. Customer acquisition volume
+-- 2. Customer retention
+-- 3. GMV retention / revenue quality
+-- ============================================================
+
+WITH cohort_base AS (
+  SELECT 
+    -- PERBAIKAN 1: Mengubah cohort_month menjadi potongan bulan dari first_contract_date
+    DATE_TRUNC(first_contract_date, MONTH) AS cohort_month,
+    
+    -- Extract month number and month name
+    EXTRACT(MONTH FROM first_contract_date) AS cohort_month_number,
+    FORMAT_DATE('%B', first_contract_date) AS cohort_month_name,
+    
+    -- Customer Metrics
+    COUNT(*) AS cohort_customers,
+    COUNTIF(renewed = 1) AS renewed_customers,
+    COUNTIF(renewed = 0) AS churned_customers,
+    
+    -- Customer Retention
+    ROUND(
+      SAFE_DIVIDE(COUNTIF(renewed = 1), COUNT(*)) * 100, 
+      2
+    ) AS customer_retention_pct,
+    
+    -- GMV Metrics (PERBAIKAN 2: Mengubah nama kolom initial_gmv menjadi first_gmv)
+    SUM(first_gmv) AS total_initial_gmv,
+    SUM(renewal_gmv) AS total_renewal_gmv,
+    
+    -- GMV Retention
+    ROUND(
+      SAFE_DIVIDE(SUM(renewal_gmv), SUM(first_gmv)) * 100, 
+      2
+    ) AS gmv_retention_pct,
+    
+    -- GMV Change
+    SUM(renewal_gmv) - SUM(first_gmv) AS total_gmv_change,
+    ROUND(
+      SAFE_DIVIDE(SUM(renewal_gmv) - SUM(first_gmv), SUM(first_gmv)) * 100, 
+      2
+    ) AS gmv_change_pct
+    
+  FROM `new-portfolio-1.PeopleU_B2B_Software_SaaS.customer_360_table`
+  
+  -- PERBAIKAN 3: Menyesuaikan komponen GROUP BY berdasarkan kolom hasil kalkulasi di atas
+  GROUP BY 
+    cohort_month,
+    cohort_month_number,
+    cohort_month_name
+), 
+seasonality_summary AS (
+  SELECT 
+    cohort_month_number, 
+    cohort_month_name, 
+    -- Number of yearly cohorts represented
+    COUNT(*) AS number_of_cohorts, 
+    -- ========================================================
+    -- Acquisition Seasonality
+    -- ========================================================
+    SUM(cohort_customers) AS total_acquired_customers, 
+    ROUND(AVG(cohort_customers), 2) AS avg_customers_per_cohort, 
+    -- ========================================================
+    -- Customer Retention Seasonality (Weighted calculation)
+    -- ========================================================
+    SUM(renewed_customers) AS total_renewed_customers, 
+    SUM(churned_customers) AS total_churned_customers, 
+    ROUND(
+      SAFE_DIVIDE(SUM(renewed_customers), SUM(cohort_customers)) * 100, 
+      2
+    ) AS weighted_customer_retention_pct, 
+    -- ========================================================
+    -- GMV Seasonality (Ditambahkan ROUND desimal agar konsisten rapi)
+    -- ========================================================
+    ROUND(SUM(total_initial_gmv), 2) AS total_initial_gmv, 
+    ROUND(SUM(total_renewal_gmv), 2) AS total_renewal_gmv, 
+    ROUND(
+      SAFE_DIVIDE(SUM(total_renewal_gmv), SUM(total_initial_gmv)) * 100, 
+      2
+    ) AS weighted_gmv_retention_pct, 
+    ROUND(SUM(total_gmv_change), 2) AS total_gmv_change, 
+    ROUND(
+      SAFE_DIVIDE(SUM(total_gmv_change), SUM(total_initial_gmv)) * 100, 
+      2
+    ) AS weighted_gmv_change_pct 
+  FROM cohort_base 
+  GROUP BY 
+    cohort_month_number, 
+    cohort_month_name
+) 
+SELECT 
+  cohort_month_number, 
+  cohort_month_name, 
+  number_of_cohorts, 
+  -- Acquisition
+  total_acquired_customers, 
+  avg_customers_per_cohort, 
+  -- Customer Quality
+  total_renewed_customers, 
+  total_churned_customers, 
+  weighted_customer_retention_pct, 
+  -- GMV Quality
+  total_initial_gmv, 
+  total_renewal_gmv, 
+  weighted_gmv_retention_pct, 
+  total_gmv_change, 
+  weighted_gmv_change_pct 
+FROM seasonality_summary 
+ORDER BY cohort_month_number;
