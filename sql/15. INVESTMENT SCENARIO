@@ -1,0 +1,193 @@
+  -- ============================================================
+-- M2-C — INCREMENTAL MARKETING INVESTMENT SCENARIO MODEL
+-- ============================================================
+-- Purpose:
+-- Estimate expected incremental Leads / Contracts / GMV
+-- under +5%, +10%, +15% incremental spend scenarios.
+--
+-- This is SCENARIO PLANNING, not causal forecasting.
+-- ============================================================
+
+WITH channel_baseline AS (
+
+    SELECT 'Referral' AS channel,
+        395000000 AS current_spend,
+        790 AS current_leads,
+        253 AS current_contracts,
+        2307171 AS lifecycle_gmv_per_lead,
+        32.03 AS conversion_rate_pct,
+        1.00 AS observed_lead_elasticity,
+        1.03 AS observed_contract_elasticity,
+        0.60 AS observed_gmv_elasticity
+
+    UNION ALL
+
+    SELECT 'CPC',
+        120000000,
+        1064,
+        265,
+        741861,
+        24.91,
+        1.19,
+        1.17,
+        1.33
+
+    UNION ALL
+
+    SELECT 'Direct',
+        150200000,
+        598,
+        168,
+        1262387,
+        28.09,
+        1.00,
+        1.35,
+        1.46
+
+    UNION ALL
+
+    SELECT 'Organic Search',
+        121100000,
+        482,
+        104,
+        1003952,
+        21.58,
+        1.00,
+        1.39,
+        1.19
+
+    UNION ALL
+
+    SELECT 'Organic Social',
+        116300000,
+        463,
+        111,
+        779449,
+        23.97,
+        1.00,
+        0.79,
+        0.65
+),
+
+scenarios AS (
+
+    SELECT 'Conservative' AS scenario, 0.50 AS elasticity_factor
+    UNION ALL
+    SELECT 'Base', 1.00
+    UNION ALL
+    SELECT 'Upside', 1.25
+),
+
+investment_levels AS (
+
+    SELECT '5% Incremental Spend' AS investment_level, 0.05 AS spend_growth
+    UNION ALL
+    SELECT '10%', 0.10
+    UNION ALL
+    SELECT '15%', 0.15
+),
+
+scenario_model AS (
+
+    SELECT
+        b.*,
+        s.scenario,
+        s.elasticity_factor,
+        i.investment_level,
+        i.spend_growth,
+
+        -- Incremental spend
+        b.current_spend * i.spend_growth
+            AS incremental_spend,
+
+        -- Effective lead elasticity
+        b.observed_lead_elasticity
+        * s.elasticity_factor
+            AS effective_lead_elasticity,
+
+        -- Expected lead growth
+        i.spend_growth
+        * b.observed_lead_elasticity
+        * s.elasticity_factor
+            AS expected_lead_growth,
+
+        -- Expected incremental leads
+        b.current_leads
+        * i.spend_growth
+        * b.observed_lead_elasticity
+        * s.elasticity_factor
+            AS incremental_leads,
+
+        -- Expected incremental contracts
+        b.current_contracts
+        * i.spend_growth
+        * b.observed_contract_elasticity
+        * s.elasticity_factor
+            AS incremental_contracts
+
+    FROM channel_baseline AS b
+
+    CROSS JOIN scenarios AS s
+
+    CROSS JOIN investment_levels AS i
+)
+
+SELECT
+
+    channel,
+
+    scenario,
+
+    investment_level,
+
+    ROUND(incremental_spend, 0)
+        AS incremental_spend,
+
+    ROUND(
+        100 * expected_lead_growth,
+        2
+    ) AS expected_lead_growth_pct,
+
+    ROUND(
+        incremental_leads,
+        1
+    ) AS expected_incremental_leads,
+
+    ROUND(
+        incremental_contracts,
+        1
+    ) AS expected_incremental_contracts,
+
+    ROUND(
+        incremental_leads
+        * lifecycle_gmv_per_lead,
+        0
+    ) AS potential_incremental_lifecycle_gmv,
+
+    -- Quality guardrail:
+    -- use historical conversion
+    conversion_rate_pct
+        AS historical_conversion_guardrail,
+
+    observed_lead_elasticity,
+    observed_contract_elasticity,
+    observed_gmv_elasticity
+
+FROM scenario_model
+
+ORDER BY
+    CASE channel
+        WHEN 'Referral' THEN 1
+        WHEN 'CPC' THEN 2
+        WHEN 'Direct' THEN 3
+        WHEN 'Organic Search' THEN 4
+        WHEN 'Organic Social' THEN 5
+    END,
+
+    CASE scenario
+        WHEN 'Conservative' THEN 1
+        WHEN 'Base' THEN 2
+        WHEN 'Upside' THEN 3
+    END,
+
+    spend_growth;
