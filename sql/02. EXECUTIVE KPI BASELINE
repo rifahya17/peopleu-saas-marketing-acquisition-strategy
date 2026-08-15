@@ -1,0 +1,57 @@
+#EXECUTIVE BASELINE KPI landscape display
+SELECT
+  -- Customer Base
+  COUNT(*) AS total_customers,
+
+  -- Renewal & Churn
+  COUNTIF(renewed = 1) AS renewed_customers,
+  COUNTIF(renewed = 0) AS churned_customers,
+  ROUND(
+    SAFE_DIVIDE(COUNTIF(renewed = 1), COUNT(*)) * 100,
+    2
+  ) AS renewal_rate_pct,
+  ROUND(
+    SAFE_DIVIDE(COUNTIF(renewed = 0), COUNT(*)) * 100,
+    2
+  ) AS churn_rate_pct,
+
+  -- Lifecycle Movement
+  COUNTIF(lifecycle_movement = 'Retained') AS retained_customers,
+  COUNTIF(lifecycle_movement = 'Upgrade') AS upgraded_customers,
+  ROUND(
+    SAFE_DIVIDE(
+      COUNTIF(lifecycle_movement = 'Retained'),
+      COUNT(*)
+    ) * 100,
+    2
+  ) AS retention_rate_pct,
+  ROUND(
+    SAFE_DIVIDE(
+      COUNTIF(lifecycle_movement = 'Upgrade'),
+      COUNT(*)
+    ) * 100,
+    2
+  ) AS upgrade_rate_pct,
+
+  -- GMV
+  ROUND(SUM(first_gmv), 2) AS total_initial_gmv,
+  ROUND(SUM(renewal_gmv), 2) AS total_renewal_gmv,
+
+  -- GMV Retention
+  ROUND(
+    SAFE_DIVIDE(
+      SUM(renewal_gmv),
+      SUM(first_gmv)
+    ) * 100,
+    2
+  ) AS gmv_retention_rate_pct,
+
+  -- GMV Change
+  ROUND(SUM(gmv_change), 2) AS total_gmv_change,
+
+  -- Customer Value
+  ROUND(AVG(first_gmv), 2) AS avg_initial_gmv,
+  ROUND(AVG(renewal_gmv), 2) AS avg_renewal_gmv
+
+FROM
+  `new-portfolio-1.PeopleU_B2B_Software_SaaS.customer_360_table`;
