@@ -85,3 +85,37 @@ Spend Response / Elasticity
 Investment Scenarios
       ↓
 Strategic Recommendation
+
+---
+
+## 🧩 Repository Structure
+
+```text
+peopleu-saas-marketing-acquisition-strategy/
+│
+├── presentation/
+│   ├── README.md
+│   └── PeopleU_Marketing_Acquisition_Strategy.pdf
+│
+├── sql/
+│   ├── 01_DATA_FOUNDATION.sql
+│   ├── 02_KPI_BASELINE.sql
+│   ├── 03_LEAD_CONTRACT_INTEGRITY.sql
+│   ├── 04_COHORT_RETENTION.sql
+│   ├── 05_QUALIFIED_LEAD_FOUNDATION.sql
+│   ├── 06_LEAD_LEVEL_MASTER.sql
+│   ├── 07_QUALIFIED_LEAD_SCORING.sql
+│   ├── 08_CHANNEL_SEGMENT_ANALYSIS.sql
+│   ├── 09_INTENT_VALIDATION.sql
+│   ├── 10_CORE_ACQUISITION_MOTION.sql
+│   ├── 11_MARKETING_SPEND_VALIDATION.sql
+│   ├── 12_CHANNEL_ECONOMIC_EFFICIENCY.sql
+│   ├── 13_SPEND_RESPONSE.sql
+│   ├── 14_CHANNEL_SCALING_SCORECARD.sql
+│   └── 15_INVESTMENT_SCENARIO.sql
+│
+├── documentation/
+│   └── methodology.md
+│
+├── README.md
+└── LICENSE
