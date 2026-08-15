@@ -1,0 +1,244 @@
+-- ============================================================
+-- M2-B — MARKETING CHANNEL SCALING SCORECARD
+-- ============================================================
+
+WITH spend_long AS (
+  SELECT
+    cohort_month,
+    'CPC' AS session_source,
+    cpc_spend AS marketing_spend
+  FROM `new-portfolio-1.PeopleU_B2B_Software_SaaS.saas_additional_clean`
+  UNION ALL
+  SELECT
+    cohort_month,
+    'Direct',
+    direct_spend
+  FROM `new-portfolio-1.PeopleU_B2B_Software_SaaS.saas_additional_clean`
+  UNION ALL
+  SELECT
+    cohort_month,
+    'Organic Search',
+    organic_search_spend
+  FROM `new-portfolio-1.PeopleU_B2B_Software_SaaS.saas_additional_clean`
+  UNION ALL
+  SELECT
+    cohort_month,
+    'Organic Social',
+    organic_social_spend
+  FROM `new-portfolio-1.PeopleU_B2B_Software_SaaS.saas_additional_clean`
+  UNION ALL
+  SELECT
+    cohort_month,
+    'Referral',
+    referral_spend
+  FROM `new-portfolio-1.PeopleU_B2B_Software_SaaS.saas_additional_clean`
+),
+
+lead_base AS (
+  SELECT DISTINCT
+    l.leads_id,
+    DATE_TRUNC(DATE(l.leads_registered), MONTH) AS acquisition_month,
+    CASE
+      WHEN LOWER(TRIM(s.session_source)) IN ('referral', 'refferal') THEN 'Referral'
+      WHEN LOWER(TRIM(s.session_source)) = 'cpc' THEN 'CPC'
+      WHEN LOWER(TRIM(s.session_source)) = 'direct' THEN 'Direct'
+      WHEN LOWER(TRIM(s.session_source)) IN ('organic search', 'organic_search') THEN 'Organic Search'
+      WHEN LOWER(TRIM(s.session_source)) IN ('organic social', 'organic_social') THEN 'Organic Social'
+      ELSE TRIM(s.session_source)
+    END AS session_source
+  FROM `new-portfolio-1.PeopleU_B2B_Software_SaaS.leads` AS l
+  LEFT JOIN `new-portfolio-1.PeopleU_B2B_Software_SaaS.sessions_source` AS s
+    ON l.session_source_code = s.session_source_code
+),
+
+customer_summary AS (
+  SELECT
+    leads_id,
+    total_observed_gmv AS lifecycle_gmv
+  FROM `new-portfolio-1.PeopleU_B2B_Software_SaaS.customer_360_table`
+),
+
+monthly_channel AS (
+  SELECT
+    l.acquisition_month AS cohort_month,
+    l.session_source,
+    COUNT(*) AS total_leads,
+    COUNTIF(c.leads_id IS NOT NULL) AS contracted_leads,
+    SUM(COALESCE(c.lifecycle_gmv, 0)) AS lifecycle_gmv
+  FROM lead_base AS l
+  LEFT JOIN customer_summary AS c
+    ON l.leads_id = c.leads_id
+  GROUP BY
+    l.acquisition_month,
+    l.session_source
+),
+
+monthly_panel AS (
+  SELECT
+    s.cohort_month,
+    s.session_source,
+    s.marketing_spend,
+    COALESCE(m.total_leads, 0) AS total_leads,
+    COALESCE(m.contracted_leads, 0) AS contracted_leads,
+    COALESCE(m.lifecycle_gmv, 0) AS lifecycle_gmv
+  FROM spend_long AS s
+  LEFT JOIN monthly_channel AS m
+    ON s.cohort_month = m.cohort_month
+    AND s.session_source = m.session_source
+),
+
+monthly_changes AS (
+  SELECT
+    *,
+    LAG(marketing_spend) OVER (PARTITION BY session_source ORDER BY cohort_month) AS prev_spend,
+    LAG(total_leads) OVER (PARTITION BY session_source ORDER BY cohort_month) AS prev_leads,
+    LAG(contracted_leads) OVER (PARTITION BY session_source ORDER BY cohort_month) AS prev_contracts,
+    LAG(lifecycle_gmv) OVER (PARTITION BY session_source ORDER BY cohort_month) AS prev_gmv
+  FROM monthly_panel
+),
+
+elasticity_monthly AS (
+  SELECT
+    *,
+    SAFE_DIVIDE(
+      SAFE_DIVIDE(total_leads - prev_leads, prev_leads),
+      SAFE_DIVIDE(marketing_spend - prev_spend, prev_spend)
+    ) AS lead_elasticity,
+    SAFE_DIVIDE(
+      SAFE_DIVIDE(contracted_leads - prev_contracts, prev_contracts),
+      SAFE_DIVIDE(marketing_spend - prev_spend, prev_spend)
+    ) AS contract_elasticity,
+    SAFE_DIVIDE(
+      SAFE_DIVIDE(lifecycle_gmv - prev_gmv, prev_gmv),
+      SAFE_DIVIDE(marketing_spend - prev_spend, prev_spend)
+    ) AS gmv_elasticity
+  FROM monthly_changes
+  WHERE prev_spend > 0
+),
+
+channel_economic AS (
+  SELECT
+    session_source,
+    SUM(marketing_spend) AS total_spend,
+    SUM(total_leads) AS total_leads,
+    SUM(contracted_leads) AS total_contracts,
+    SUM(lifecycle_gmv) AS total_lifecycle_gmv,
+    SAFE_DIVIDE(SUM(contracted_leads), SUM(total_leads)) AS conversion_rate,
+    SAFE_DIVIDE(SUM(lifecycle_gmv), SUM(total_leads)) AS lifecycle_gmv_per_lead,
+    SAFE_DIVIDE(SUM(lifecycle_gmv), SUM(marketing_spend)) AS gmv_per_spend,
+    SAFE_DIVIDE(SUM(marketing_spend), SUM(total_leads)) AS cpl,
+    SAFE_DIVIDE(SUM(marketing_spend), SUM(contracted_leads)) AS cost_per_contract
+  FROM monthly_panel
+  GROUP BY session_source
+),
+
+channel_response AS (
+  SELECT
+    session_source,
+    APPROX_QUANTILES(lead_elasticity, 100)[OFFSET(50)] AS median_lead_elasticity,
+    APPROX_QUANTILES(contract_elasticity, 100)[OFFSET(50)] AS median_contract_elasticity,
+    APPROX_QUANTILES(gmv_elasticity, 100)[OFFSET(50)] AS median_gmv_elasticity,
+    COUNTIF(gmv_elasticity > 0) AS positive_gmv_months,
+    COUNT(gmv_elasticity) AS observed_elasticity_months,
+    SAFE_DIVIDE(COUNTIF(gmv_elasticity > 0), COUNT(gmv_elasticity)) AS positive_gmv_month_share
+  FROM elasticity_monthly
+  GROUP BY session_source
+),
+
+combined AS (
+  SELECT
+    e.*,
+    r.median_lead_elasticity,
+    r.median_contract_elasticity,
+    r.median_gmv_elasticity,
+    r.positive_gmv_months,
+    r.observed_elasticity_months,
+    r.positive_gmv_month_share
+  FROM channel_economic AS e
+  LEFT JOIN channel_response AS r
+  USING (session_source)
+),
+
+-- PERBAIKAN UTAMA: Menghitung nilai benchmark menggunakan fungsi agregasi MURNI (tanpa klausa OVER)
+macro_benchmarks AS (
+  SELECT
+    APPROX_QUANTILES(gmv_per_spend, 100)[OFFSET(50)] AS median_gmv_per_spend,
+    APPROX_QUANTILES(conversion_rate, 100)[OFFSET(50)] AS median_conversion,
+    APPROX_QUANTILES(median_lead_elasticity, 100)[OFFSET(50)] AS median_channel_lead_elasticity,
+    APPROX_QUANTILES(median_gmv_elasticity, 100)[OFFSET(50)] AS median_channel_gmv_elasticity
+  FROM combined
+),
+
+-- Menggabungkan tabel baris utama dengan nilai benchmark tunggal menggunakan CROSS JOIN
+benchmarks AS (
+  SELECT
+    c.*,
+    b.median_gmv_per_spend,
+    b.median_conversion,
+    b.median_channel_lead_elasticity,
+    b.median_channel_gmv_elasticity
+  FROM combined c
+  CROSS JOIN macro_benchmarks b
+)
+
+SELECT
+  session_source,
+  -- Economic
+  ROUND(total_spend, 0) AS total_spend,
+  ROUND(gmv_per_spend, 2) AS lifecycle_gmv_per_rp_spend,
+  ROUND(cpl, 0) AS CPL,
+  ROUND(cost_per_contract, 0) AS cost_per_contract,
+  -- Acquisition quality
+  total_leads,
+  total_contracts,
+  ROUND(100 * conversion_rate, 2) AS conversion_rate_pct,
+  ROUND(lifecycle_gmv_per_lead, 0) AS lifecycle_gmv_per_lead,
+  -- Scalability
+  ROUND(median_lead_elasticity, 2) AS median_lead_elasticity,
+  ROUND(median_contract_elasticity, 2) AS median_contract_elasticity,
+  ROUND(median_gmv_elasticity, 2) AS median_gmv_elasticity,
+  ROUND(100 * positive_gmv_month_share, 1) AS positive_gmv_response_pct,
+  observed_elasticity_months,
+  -- Relative benchmark flags
+  CASE
+    WHEN gmv_per_spend >= median_gmv_per_spend THEN 'Above Median'
+    ELSE 'Below Median'
+  END AS economic_efficiency,
+  CASE
+    WHEN conversion_rate >= median_conversion THEN 'Above Median'
+    ELSE 'Below Median'
+  END AS acquisition_quality,
+  CASE
+    WHEN median_lead_elasticity >= median_channel_lead_elasticity THEN 'Above Median'
+    ELSE 'Below Median'
+  END AS scalability_signal,
+  -- ========================================================
+  -- FINAL STRATEGIC ROLE
+  -- ========================================================
+  CASE
+    WHEN gmv_per_spend >= median_gmv_per_spend
+         AND conversion_rate >= median_conversion
+         AND median_lead_elasticity >= 1
+         AND median_gmv_elasticity > 0 THEN 'SCALE / CORE'
+    WHEN median_lead_elasticity >= 1
+         AND median_gmv_elasticity > 1
+         AND gmv_per_spend < median_gmv_per_spend THEN 'SELECTIVE SCALE'
+    WHEN gmv_per_spend >= median_gmv_per_spend
+         AND conversion_rate >= median_conversion
+         AND median_lead_elasticity < 1 THEN 'QUALITY / PROTECT'
+    WHEN gmv_per_spend >= median_gmv_per_spend
+         AND median_gmv_elasticity > 0 THEN 'MAINTAIN / OPTIMIZE'
+    WHEN median_gmv_elasticity <= 0
+         OR positive_gmv_month_share < 0.60 THEN 'REASSESS / DEPRIORITIZE'
+    ELSE 'MAINTAIN / OPTIMIZE'
+  END AS strategic_role
+FROM benchmarks
+ORDER BY
+  CASE strategic_role
+    WHEN 'SCALE / CORE' THEN 1
+    WHEN 'SELECTIVE SCALE' THEN 2
+    WHEN 'QUALITY / PROTECT' THEN 3
+    WHEN 'MAINTAIN / OPTIMIZE' THEN 4
+    WHEN 'REASSESS / DEPRIORITIZE' THEN 5
+    ELSE 6
+  END;
