@@ -1,0 +1,435 @@
+-- ============================================================
+-- M1-B-1 — CORRECTED MARKETING CHANNEL ECONOMIC EFFICIENCY
+-- ============================================================
+--
+-- Objective:
+-- Compare marketing spend against:
+-- Leads -> Contracts -> Initial GMV -> Lifecycle GMV
+--
+-- Grain before aggregation:
+-- 1 row per leads_id
+--
+-- IMPORTANT:
+-- Referral spend column = referral_spend
+-- Canonical acquisition channel = Referral
+-- ============================================================
+
+WITH spend_long AS (
+
+    -- ========================================================
+    -- CPC
+    -- ========================================================
+    SELECT
+        cohort_month,
+        'CPC' AS session_source,
+        cpc_spend AS marketing_spend
+    FROM `new-portfolio-1.PeopleU_B2B_Software_SaaS.saas_additional_clean`
+
+    UNION ALL
+
+    -- ========================================================
+    -- DIRECT
+    -- ========================================================
+    SELECT
+        cohort_month,
+        'Direct' AS session_source,
+        direct_spend AS marketing_spend
+    FROM `new-portfolio-1.PeopleU_B2B_Software_SaaS.saas_additional_clean`
+
+    UNION ALL
+
+    -- ========================================================
+    -- ORGANIC SEARCH
+    -- ========================================================
+    SELECT
+        cohort_month,
+        'Organic Search' AS session_source,
+        organic_search_spend AS marketing_spend
+    FROM `new-portfolio-1.PeopleU_B2B_Software_SaaS.saas_additional_clean`
+
+    UNION ALL
+
+    -- ========================================================
+    -- ORGANIC SOCIAL
+    -- ========================================================
+    SELECT
+        cohort_month,
+        'Organic Social' AS session_source,
+        organic_social_spend AS marketing_spend
+    FROM `new-portfolio-1.PeopleU_B2B_Software_SaaS.saas_additional_clean`
+
+    UNION ALL
+
+    -- ========================================================
+    -- REFERRAL
+    -- IMPORTANT: referral_spend
+    -- ========================================================
+    SELECT
+        cohort_month,
+        'Referral' AS session_source,
+        referral_spend AS marketing_spend
+    FROM `new-portfolio-1.PeopleU_B2B_Software_SaaS.saas_additional_clean`
+),
+
+
+-- ============================================================
+-- 1. LEAD BASE
+-- Canonicalize acquisition channel name
+-- ============================================================
+
+lead_base AS (
+
+    SELECT DISTINCT
+
+        l.leads_id,
+
+        DATE_TRUNC(
+            DATE(l.leads_registered),
+            MONTH
+        ) AS acquisition_month,
+
+        CASE
+
+            WHEN LOWER(TRIM(s.session_source))
+                IN ('referral', 'refferal')
+                THEN 'Referral'
+
+            WHEN LOWER(TRIM(s.session_source))
+                = 'cpc'
+                THEN 'CPC'
+
+            WHEN LOWER(TRIM(s.session_source))
+                = 'direct'
+                THEN 'Direct'
+
+            WHEN LOWER(TRIM(s.session_source))
+                IN ('organic search', 'organic_search')
+                THEN 'Organic Search'
+
+            WHEN LOWER(TRIM(s.session_source))
+                IN ('organic social', 'organic_social')
+                THEN 'Organic Social'
+
+            ELSE TRIM(s.session_source)
+
+        END AS session_source
+
+    FROM `new-portfolio-1.PeopleU_B2B_Software_SaaS.leads` AS l
+
+    LEFT JOIN
+        `new-portfolio-1.PeopleU_B2B_Software_SaaS.sessions_source` AS s
+
+        ON l.session_source_code = s.session_source_code
+),
+
+
+-- ============================================================
+-- 2. CUSTOMER 360
+-- ============================================================
+
+customer_summary AS (
+
+    SELECT
+
+        leads_id,
+
+        first_gmv,
+
+        total_observed_gmv AS lifecycle_gmv,
+
+        renewed
+
+    FROM `new-portfolio-1.PeopleU_B2B_Software_SaaS.customer_360_table`
+),
+
+
+-- ============================================================
+-- 3. LEAD-LEVEL MASTER
+-- 1 row = 1 leads_id
+-- ============================================================
+
+lead_level AS (
+
+    SELECT
+
+        l.leads_id,
+
+        l.acquisition_month,
+
+        l.session_source,
+
+        CASE
+            WHEN c.leads_id IS NOT NULL
+                THEN 1
+            ELSE 0
+        END AS converted_flag,
+
+        COALESCE(
+            c.first_gmv,
+            0
+        ) AS first_gmv,
+
+        COALESCE(
+            c.lifecycle_gmv,
+            0
+        ) AS lifecycle_gmv,
+
+        COALESCE(
+            c.renewed,
+            0
+        ) AS renewed_flag
+
+    FROM lead_base AS l
+
+    LEFT JOIN customer_summary AS c
+
+        ON l.leads_id = c.leads_id
+),
+
+
+-- ============================================================
+-- 4. MONTH × CHANNEL PERFORMANCE
+-- ============================================================
+
+monthly_channel AS (
+
+    SELECT
+
+        acquisition_month AS cohort_month,
+
+        session_source,
+
+        COUNT(*) AS total_leads,
+
+        SUM(converted_flag) AS contracted_leads,
+
+        SUM(first_gmv) AS total_initial_gmv,
+
+        SUM(lifecycle_gmv) AS total_lifecycle_gmv,
+
+        SUM(renewed_flag) AS renewed_customers
+
+    FROM lead_level
+
+    GROUP BY
+
+        acquisition_month,
+        session_source
+),
+
+
+-- ============================================================
+-- 5. JOIN SPEND WITH ACQUISITION
+-- ============================================================
+
+channel_economics AS (
+
+    SELECT
+
+        s.cohort_month,
+
+        s.session_source,
+
+        s.marketing_spend,
+
+        COALESCE(
+            m.total_leads,
+            0
+        ) AS total_leads,
+
+        COALESCE(
+            m.contracted_leads,
+            0
+        ) AS contracted_leads,
+
+        COALESCE(
+            m.total_initial_gmv,
+            0
+        ) AS total_initial_gmv,
+
+        COALESCE(
+            m.total_lifecycle_gmv,
+            0
+        ) AS total_lifecycle_gmv,
+
+        COALESCE(
+            m.renewed_customers,
+            0
+        ) AS renewed_customers
+
+    FROM spend_long AS s
+
+    LEFT JOIN monthly_channel AS m
+
+        ON s.cohort_month = m.cohort_month
+
+        AND s.session_source = m.session_source
+)
+
+
+-- ============================================================
+-- 6. FINAL CHANNEL ECONOMIC EFFICIENCY
+-- ============================================================
+
+SELECT
+
+    session_source,
+
+    -- --------------------------------------------------------
+    -- SPEND
+    -- --------------------------------------------------------
+
+    SUM(marketing_spend)
+        AS total_marketing_spend,
+
+    -- --------------------------------------------------------
+    -- ACQUISITION VOLUME
+    -- --------------------------------------------------------
+
+    SUM(total_leads)
+        AS total_leads,
+
+    SUM(contracted_leads)
+        AS contracted_leads,
+
+    -- --------------------------------------------------------
+    -- ECONOMIC VALUE
+    -- --------------------------------------------------------
+
+    SUM(total_initial_gmv)
+        AS total_initial_gmv,
+
+    SUM(total_lifecycle_gmv)
+        AS total_lifecycle_gmv,
+
+    -- --------------------------------------------------------
+    -- COST EFFICIENCY
+    -- --------------------------------------------------------
+
+    ROUND(
+        SAFE_DIVIDE(
+            SUM(marketing_spend),
+            SUM(total_leads)
+        ),
+        0
+    ) AS CPL,
+
+    ROUND(
+        SAFE_DIVIDE(
+            SUM(marketing_spend),
+            SUM(contracted_leads)
+        ),
+        0
+    ) AS cost_per_contract,
+
+    -- --------------------------------------------------------
+    -- CONVERSION
+    -- --------------------------------------------------------
+
+    ROUND(
+        100 * SAFE_DIVIDE(
+            SUM(contracted_leads),
+            SUM(total_leads)
+        ),
+        2
+    ) AS conversion_rate_pct,
+
+    -- --------------------------------------------------------
+    -- VALUE PER ACQUIRED LEAD
+    -- --------------------------------------------------------
+
+    ROUND(
+        SAFE_DIVIDE(
+            SUM(total_lifecycle_gmv),
+            SUM(total_leads)
+        ),
+        0
+    ) AS lifecycle_gmv_per_lead,
+
+    -- --------------------------------------------------------
+    -- VALUE PER CONTRACT
+    -- --------------------------------------------------------
+
+    ROUND(
+        SAFE_DIVIDE(
+            SUM(total_lifecycle_gmv),
+            SUM(contracted_leads)
+        ),
+        0
+    ) AS lifecycle_gmv_per_contract,
+
+    -- --------------------------------------------------------
+    -- SPEND SHARE
+    -- --------------------------------------------------------
+
+    ROUND(
+        100 * SAFE_DIVIDE(
+            SUM(marketing_spend),
+            SUM(
+                SUM(marketing_spend)
+            ) OVER ()
+        ),
+        2
+    ) AS spend_share_pct,
+
+    -- --------------------------------------------------------
+    -- LEAD SHARE
+    -- --------------------------------------------------------
+
+    ROUND(
+        100 * SAFE_DIVIDE(
+            SUM(total_leads),
+            SUM(
+                SUM(total_leads)
+            ) OVER ()
+        ),
+        2
+    ) AS lead_share_pct,
+
+    -- --------------------------------------------------------
+    -- CONTRACT SHARE
+    -- --------------------------------------------------------
+
+    ROUND(
+        100 * SAFE_DIVIDE(
+            SUM(contracted_leads),
+            SUM(
+                SUM(contracted_leads)
+            ) OVER ()
+        ),
+        2
+    ) AS contract_share_pct,
+
+    -- --------------------------------------------------------
+    -- LIFECYCLE GMV SHARE
+    -- --------------------------------------------------------
+
+    ROUND(
+        100 * SAFE_DIVIDE(
+            SUM(total_lifecycle_gmv),
+            SUM(
+                SUM(total_lifecycle_gmv)
+            ) OVER ()
+        ),
+        2
+    ) AS lifecycle_gmv_share_pct,
+
+    -- --------------------------------------------------------
+    -- LIFECYCLE VALUE / SPEND
+    -- --------------------------------------------------------
+
+    ROUND(
+        SAFE_DIVIDE(
+            SUM(total_lifecycle_gmv),
+            SUM(marketing_spend)
+        ),
+        2
+    ) AS lifecycle_gmv_per_rp_spend
+
+FROM channel_economics
+
+GROUP BY
+    session_source
+
+ORDER BY
+    lifecycle_gmv_per_rp_spend DESC;
