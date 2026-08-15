@@ -1,0 +1,357 @@
+-- ============================================================
+-- SQL G — QUALIFIED LEAD × ACQUISITION CHANNEL EFFECTIVENESS
+-- ============================================================
+-- Business Question:
+-- For each Employee Segment × Industry,
+-- which acquisition channel generates the best combination of:
+-- 1. Lead conversion
+-- 2. Initial economic value
+-- 3. Lifecycle economic value
+-- 4. Renewal quality
+-- 5. Sufficient evidence
+--
+-- Grain before aggregation = 1 row per leads_id
+-- Final grain = employee_segment × industry × session_source
+-- ============================================================
+
+
+WITH lead_base AS (
+  -- ==========================================================
+  -- STEP 1: Lead universe
+  -- ==========================================================
+  SELECT DISTINCT
+    l.leads_id,
+
+    s.session_source,
+
+    CASE
+      WHEN l.number_of_employee <= 10 THEN '01. 1-10'
+      WHEN l.number_of_employee <= 50 THEN '02. 11-50'
+      WHEN l.number_of_employee <= 100 THEN '03. 51-100'
+      WHEN l.number_of_employee <= 250 THEN '04. 101-250'
+      ELSE '05. 251+'
+    END AS employee_segment,
+
+    i.industry
+
+  FROM `new-portfolio-1.PeopleU_B2B_Software_SaaS.leads` AS l
+
+  LEFT JOIN `new-portfolio-1.PeopleU_B2B_Software_SaaS.sessions_source` AS s
+    ON l.session_source_code = s.session_source_code
+
+  LEFT JOIN `new-portfolio-1.PeopleU_B2B_Software_SaaS.industries` AS i
+    ON l.industry_code = i.industry_code
+),
+
+
+-- ============================================================
+-- STEP 2: Customer summary
+-- IMPORTANT:
+-- customer_360_table is already validated at leads_id grain
+-- ============================================================
+customer_summary AS (
+  SELECT
+    leads_id,
+    contract_count,
+    first_gmv,
+    renewal_gmv,
+    total_observed_gmv AS lifecycle_gmv,
+    renewed
+
+  FROM `new-portfolio-1.PeopleU_B2B_Software_SaaS.customer_360_table`
+),
+
+
+-- ============================================================
+-- STEP 3: Lead-level acquisition master
+-- Exactly 1 row per leads_id
+-- ============================================================
+lead_level AS (
+  SELECT
+    l.leads_id,
+    l.session_source,
+    l.employee_segment,
+    l.industry,
+
+    CASE
+      WHEN c.leads_id IS NOT NULL THEN 1
+      ELSE 0
+    END AS converted_flag,
+
+    COALESCE(c.contract_count, 0) AS contract_count,
+    COALESCE(c.first_gmv, 0) AS first_gmv,
+    COALESCE(c.renewal_gmv, 0) AS renewal_gmv,
+    COALESCE(c.lifecycle_gmv, 0) AS lifecycle_gmv,
+    COALESCE(c.renewed, 0) AS renewed_flag
+
+  FROM lead_base AS l
+
+  LEFT JOIN customer_summary AS c
+    ON l.leads_id = c.leads_id
+),
+
+
+-- ============================================================
+-- STEP 4: Overall performance by Qualified Lead Segment
+-- This reconstructs the segment-level metrics used for priority
+-- ============================================================
+segment_performance AS (
+  SELECT
+    employee_segment,
+    industry,
+
+    COUNT(*) AS segment_total_leads,
+    SUM(converted_flag) AS segment_contracted_leads,
+
+    SAFE_DIVIDE(
+      SUM(converted_flag),
+      COUNT(*)
+    ) AS segment_conversion_rate,
+
+    SAFE_DIVIDE(
+      SUM(first_gmv),
+      COUNT(*)
+    ) AS segment_initial_gmv_per_lead,
+
+    SAFE_DIVIDE(
+      SUM(lifecycle_gmv),
+      COUNT(*)
+    ) AS segment_lifecycle_gmv_per_lead,
+
+    SAFE_DIVIDE(
+      SUM(renewed_flag),
+      SUM(converted_flag)
+    ) AS segment_renewal_rate
+
+  FROM lead_level
+
+  GROUP BY
+    employee_segment,
+    industry
+),
+
+
+-- ============================================================
+-- STEP 5: Channel performance within each Lead Segment
+-- Final grain:
+-- employee_segment × industry × session_source
+-- ============================================================
+channel_segment_performance AS (
+  SELECT
+    employee_segment,
+    industry,
+    session_source,
+
+    COUNT(*) AS channel_leads,
+    SUM(converted_flag) AS channel_contracted_leads,
+    SUM(contract_count) AS channel_total_contracts,
+
+    SAFE_DIVIDE(
+      SUM(converted_flag),
+      COUNT(*)
+    ) AS conversion_rate,
+
+    SAFE_DIVIDE(
+      SUM(first_gmv),
+      COUNT(*)
+    ) AS initial_gmv_per_lead,
+
+    SAFE_DIVIDE(
+      SUM(lifecycle_gmv),
+      COUNT(*)
+    ) AS lifecycle_gmv_per_lead,
+
+    SAFE_DIVIDE(
+      SUM(lifecycle_gmv),
+      SUM(converted_flag)
+    ) AS lifecycle_gmv_per_converted_lead,
+
+    SAFE_DIVIDE(
+      SUM(renewed_flag),
+      SUM(converted_flag)
+    ) AS renewal_rate
+
+  FROM lead_level
+
+  GROUP BY
+    employee_segment,
+    industry,
+    session_source
+),
+
+
+-- ============================================================
+-- STEP 6: Add channel contribution within segment
+-- ============================================================
+channel_analysis AS (
+  SELECT
+    c.*,
+
+    s.segment_total_leads,
+    s.segment_contracted_leads,
+    s.segment_conversion_rate,
+    s.segment_initial_gmv_per_lead,
+    s.segment_lifecycle_gmv_per_lead,
+    s.segment_renewal_rate,
+
+    SAFE_DIVIDE(
+      c.channel_leads,
+      s.segment_total_leads
+    ) AS lead_share_within_segment,
+
+    SAFE_DIVIDE(
+      c.channel_contracted_leads,
+      s.segment_contracted_leads
+    ) AS contracted_lead_share_within_segment,
+
+    -- Relative conversion performance
+    SAFE_DIVIDE(
+      c.conversion_rate,
+      s.segment_conversion_rate
+    ) AS conversion_index,
+
+    -- Relative lifecycle value performance
+    SAFE_DIVIDE(
+      c.lifecycle_gmv_per_lead,
+      s.segment_lifecycle_gmv_per_lead
+    ) AS lifecycle_value_index
+
+  FROM channel_segment_performance AS c
+
+  LEFT JOIN segment_performance AS s
+    ON c.employee_segment = s.employee_segment
+    AND c.industry = s.industry
+),
+
+
+-- ============================================================
+-- STEP 7: Evidence Strength
+-- ============================================================
+evidence_classification AS (
+  SELECT
+    *,
+
+    CASE
+      WHEN channel_leads >= 50 THEN 'High Evidence'
+      WHEN channel_leads >= 30 THEN 'Moderate Evidence'
+      WHEN channel_leads >= 15 THEN 'Limited Evidence'
+      ELSE 'Low Evidence'
+    END AS channel_evidence_strength,
+
+    CASE
+      WHEN channel_leads >= 15 THEN 1
+      ELSE 0
+    END AS sufficient_evidence_flag
+
+  FROM channel_analysis
+),
+
+
+-- ============================================================
+-- STEP 8: Rank channels within each Lead Segment
+-- Ranking prioritizes:
+-- 1. Lifecycle GMV per Lead
+-- 2. Conversion Rate
+-- 3. Evidence / Volume
+--
+-- This ranking is for candidate identification,
+-- not an automatic "scale" decision.
+-- ============================================================
+channel_ranking AS (
+  SELECT
+    *,
+
+    ROW_NUMBER() OVER (
+      PARTITION BY employee_segment, industry
+      ORDER BY
+        CASE WHEN channel_leads >= 15 THEN 1 ELSE 0 END DESC,
+        lifecycle_gmv_per_lead DESC,
+        conversion_rate DESC,
+        channel_leads DESC
+    ) AS channel_rank_within_segment
+
+  FROM evidence_classification
+)
+
+
+-- ============================================================
+-- FINAL OUTPUT
+-- ============================================================
+SELECT
+  employee_segment,
+  industry,
+  session_source,
+
+  -- Segment context
+  segment_total_leads,
+  segment_contracted_leads,
+  ROUND(100 * segment_conversion_rate, 2)
+    AS segment_conversion_rate_pct,
+
+  -- Channel acquisition volume
+  channel_leads,
+
+  ROUND(
+    100 * lead_share_within_segment,
+    2
+  ) AS lead_share_within_segment_pct,
+
+  channel_contracted_leads,
+  channel_total_contracts,
+
+  ROUND(
+    100 * contracted_lead_share_within_segment,
+    2
+  ) AS contracted_lead_share_within_segment_pct,
+
+  -- Channel quality
+  ROUND(
+    100 * conversion_rate,
+    2
+  ) AS conversion_rate_pct,
+
+  ROUND(
+    initial_gmv_per_lead,
+    0
+  ) AS initial_gmv_per_lead,
+
+  ROUND(
+    lifecycle_gmv_per_lead,
+    0
+  ) AS lifecycle_gmv_per_lead,
+
+  ROUND(
+    lifecycle_gmv_per_converted_lead,
+    0
+  ) AS lifecycle_gmv_per_converted_lead,
+
+  ROUND(
+    100 * renewal_rate,
+    2
+  ) AS renewal_rate_pct,
+
+  -- Relative performance
+  ROUND(
+    conversion_index,
+    2
+  ) AS conversion_index_vs_segment,
+
+  ROUND(
+    lifecycle_value_index,
+    2
+  ) AS lifecycle_value_index_vs_segment,
+
+  -- Evidence
+  channel_evidence_strength,
+  sufficient_evidence_flag,
+
+  -- Ranking
+  channel_rank_within_segment
+
+FROM channel_ranking
+
+ORDER BY
+  employee_segment,
+  industry,
+  channel_rank_within_segment,
+  channel_leads DESC;
