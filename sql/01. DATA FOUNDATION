@@ -1,0 +1,129 @@
+==Query 1 — Schema Discovery==
+#DATA CLEANSING
+#1.Contract table
+#ensure column contain with string no over space in text
+#ensure there is no data null
+#delete duplicate data based on contract_id
+
+CREATE OR REPLACE TABLE `new-portfolio-1.PeopleU_B2B_Software_SaaS.contract_clean` AS
+WITH ranked_contracts AS (
+  SELECT *,
+         ROW_NUMBER() OVER(PARTITION BY contract_id ORDER BY date DESC) as rn
+  FROM `new-portfolio-1.PeopleU_B2B_Software_SaaS.contract`
+)
+SELECT 
+  contract_id,
+  leads_id,
+  date,
+  TRIM(subscription_type) AS subscription_type,
+  number_of_employee,
+  reten_flag,
+  user_price,
+  GMV
+FROM ranked_contracts
+WHERE rn = 1 AND contract_id IS NOT NULL;
+
+#2. discount_type table
+#ensure column contain with string no over space in text
+#ensure there is no data null
+
+CREATE OR REPLACE TABLE `new-portfolio-1.PeopleU_B2B_Software_SaaS.discount_type_clean` AS
+SELECT 
+  TRIM(discount_type_code) AS discount_type_code,
+  INITCAP(REPLACE(discount_type, '_', ' ')) AS discount_type, -- Mengubah menjadi '2021 Quarter Discount'
+  LOWER(TRIM(month_discount)) AS month_discount
+FROM `new-portfolio-1.PeopleU_B2B_Software_SaaS.discount_type`
+WHERE discount_type_code IS NOT NULL;
+
+#3. discount table
+#ensure column contain with string no over space in text
+#ensure there is no data null
+#delete duplicate data based on contract_id and discount_type_code
+
+CREATE OR REPLACE TABLE `new-portfolio-1.PeopleU_B2B_Software_SaaS.discounts_clean` AS
+WITH deduplicated AS (
+  SELECT *,
+         ROW_NUMBER() OVER(PARTITION BY contract_id, discount_type_code ORDER BY deal_won DESC) as rn
+  FROM `new-portfolio-1.PeopleU_B2B_Software_SaaS.discounts`
+)
+SELECT 
+  contract_id,
+  TRIM(discount_type_code) AS discount_type_code,
+  deal_won,
+  user_price_after,
+  reten_flag
+FROM deduplicated
+WHERE rn = 1 AND contract_id IS NOT NULL;
+
+#4. Funnel table
+#ensure column contain with string no over space in text
+#ensure there is no data null
+#delete duplicate data based on funnel_id
+
+CREATE OR REPLACE TABLE `new-portfolio-1.PeopleU_B2B_Software_SaaS.funnel_clean` AS
+SELECT 
+  funnel_id,
+  leads_id,
+  stage_id,
+  TimeStamp,
+  CASE 
+    WHEN TRIM(LOWER(reason)) = 'null' OR TRIM(reason) = '' THEN NULL 
+    ELSE TRIM(reason) 
+  END AS reason
+FROM `new-portfolio-1.PeopleU_B2B_Software_SaaS.funnel`
+WHERE funnel_id IS NOT NULL;
+
+#4. google analytic table
+#ensure column contain with string no over space and typo in text
+#ensure there is no data null
+#delete duplicate data based on ga_id
+
+CREATE OR REPLACE TABLE `new-portfolio-1.PeopleU_B2B_Software_SaaS.google_analytics_clean` AS
+WITH ga_dedup AS (
+  SELECT *,
+         ROW_NUMBER() OVER(PARTITION BY ga_id ORDER BY Page_timestamp DESC) as rn
+  FROM `new-portfolio-1.PeopleU_B2B_Software_SaaS.google_analytics`
+)
+SELECT 
+  leads_id,
+  ga_id,
+  LOWER(TRIM(Page_Name)) AS Page_Name,
+  Page_timestamp
+FROM ga_dedup
+WHERE rn = 1 AND ga_id IS NOT NULL;
+
+#5. industries table
+#ensure column contain with string no over space and typo in text
+
+CREATE OR REPLACE TABLE `new-portfolio-1.PeopleU_B2B_Software_SaaS.sessions_source_clean` AS
+SELECT 
+  session_source_code,
+  CASE 
+    WHEN TRIM(session_source) = 'Refferal' THEN 'Referral'
+    ELSE TRIM(session_source)
+  END AS session_source
+FROM `new-portfolio-1.PeopleU_B2B_Software_SaaS.sessions_source`
+WHERE session_source_code IS NOT NULL;
+
+#6. stage table
+#ensure column contain with string no over space and typo in text
+
+CREATE OR REPLACE TABLE `new-portfolio-1.PeopleU_B2B_Software_SaaS.stage_clean` AS
+SELECT 
+  stage_id,
+  CASE 
+    WHEN TRIM(stage) = 'quotation_recieved' THEN 'quotation_received'
+    ELSE TRIM(stage)
+  END AS stage
+FROM `new-portfolio-1.PeopleU_B2B_Software_SaaS.stage`
+WHERE stage_id IS NOT NULL;
+
+#7. industries & leads table
+#ensure column contain with string no over space
+CREATE OR REPLACE TABLE `new-portfolio-1.PeopleU_B2B_Software_SaaS.industries_clean` AS
+SELECT industry_code, TRIM(industry) AS industry 
+FROM `new-portfolio-1.PeopleU_B2B_Software_SaaS.industries` WHERE industry_code IS NOT NULL;
+
+CREATE OR REPLACE TABLE `new-portfolio-1.PeopleU_B2B_Software_SaaS.leads_clean` AS
+SELECT DISTINCT leads_id, session_source_code, industry_code, leads_registered, number_of_employee 
+FROM `new-portfolio-1.PeopleU_B2B_Software_SaaS.leads` WHERE leads_id IS NOT NULL;
